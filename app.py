@@ -1,324 +1,392 @@
-# app.py — Loan Default Scoring (Design Amélioré)
-# - Design professionnel centré sur l'utilisateur
-# - Regroupement logique des champs dans un formulaire principal
-# - Barre latérale pour les options et les méta-informations
-# - Résultat visuel (couleurs, jauge) pour une interprétation rapide
+# app.py — Loan Default Scoring (UI améliorée)
+# - Conserve tes règles: pas de seuil sur {total_debt_outstanding, income, years_employed, loan_amt_outstanding}
+# - Seuils indispensables: fico_score (300..850), credit_lines_outstanding >=0, customer_id >=0
+# - Saisie texte (virgule/point), validation douce (messages sans st.stop)
+# - CSV optionnel pour typer et proposer des défauts
+# - Design: cartes, presets, jauge circulaire, historique, téléchargement JSON
 
 from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
+import json
+import io
 
 import numpy as np
 import pandas as pd
 import joblib
 import streamlit as st
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 
+# ============================ Paramètres ============================
 
-# ============================ Paramètres & Configuration ============================
-
-# Configuration de la page (doit être la première commande st)
-st.set_page_config(
-    page_title="Évaluation de Risque de Crédit",
-    page_icon="🏦",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# --- Variables d'environnement et constantes ---
 MODEL_PKL  = os.getenv("MODEL_PKL", "model.pkl")
 DATA_PATH  = os.getenv("DATA_PATH", "data/Loan_Data.csv")
 TARGET_COL = os.getenv("TARGET_COL", "default")
 DEF_THRESH = float(os.getenv("THRESHOLD", "0.5"))
+PRIMARY_COLOR = os.getenv("PRIMARY_COLOR", "#4f46e5")  # indigo-600 par défaut
 
-# --- Règles de validation des champs ---
+st.set_page_config(page_title="Loan Default — Scoring", page_icon="🏦", layout="wide")
+
+# Colonnes sans seuil (min/max)
 NO_BOUNDS: set[str] = {
-    "total_debt_outstanding", "income", "years_employed",
-    "loan_amt_outstanding", "loan_amt_oustanding",
+    "total_debt_outstanding",
+    "income",
+    "years_employed",
+    "loan_amt_outstanding",
+    "loan_amt_oustanding",  # tolérance orthographe
 }
-HARD_BOUNDS: Dict[str, Tuple[Optional[float], Optional[float]]] = {
+
+# Contraintes indispensables (min, max) ; None = pas de borne
+HARD_BOUNDS: Dict[str, Tuple[float | None, float | None]] = {
     "fico_score": (300, 850),
     "credit_lines_outstanding": (0, None),
     "customer_id": (0, None),
 }
+
+# Colonnes entières (si on n'a pas le CSV pour le déduire)
 LIKELY_INT_COLS: set[str] = {
     "credit_lines_outstanding", "years_employed", "fico_score", "customer_id"
 }
 
+# Groupes UI (facultatif si la colonne est absente du modèle)
+GROUPS = {
+    "Identité": ["customer_id"],
+    "Encours": ["credit_lines_outstanding", "loan_amt_outstanding", "total_debt_outstanding"],
+    "Revenus & Emploi": ["income", "years_employed"],
+    "Score": ["fico_score"],
+}
 
-# ============================ Style CSS Personnalisé ===========================
+# ============================ Style ============================
 
-st.markdown("""
-<style>
-    /* Conteneur principal */
-    .main .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
-    /* Style des cartes de résultat */
-    .result-card {
-        padding: 25px;
-        border-radius: 10px;
-        text-align: center;
-        color: white;
-        margin-bottom: 20px;
-    }
-    .result-card h3 {
-        color: white;
-        font-size: 24px;
-        margin-bottom: 5px;
-    }
-    .result-card p {
-        font-size: 18px;
-        margin-top: 5px;
-    }
-    .low-risk {
-        background: linear-gradient(135deg, #28a745, #218838); /* Vert */
-    }
-    .high-risk {
-        background: linear-gradient(135deg, #dc3545, #c82333); /* Rouge */
-    }
-    .medium-risk {
-        background: linear-gradient(135deg, #ffc107, #e0a800); /* Orange */
-    }
-    /* Amélioration des formulaires */
-    .stForm {
-        border: 1px solid #262730; /* Bordure discrète pour le mode sombre */
-        border-radius: 10px;
-        padding: 20px;
-    }
-    [data-theme="light"] .stForm {
-        border: 1px solid #e1e4e8; /* Bordure discrète pour le mode clair */
-    }
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    f"""
+    <style>
+      /* Masquer le footer & hamburger */
+      #MainMenu {{visibility:hidden;}}
+      footer {{visibility:hidden;}}
 
+      /* Titres & cartes */
+      .app-card {{
+        border: 1px solid #e5e7eb; border-radius: 16px; padding: 16px;
+        background: #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      }}
+      .pill {{
+        display:inline-block; padding:4px 10px; border-radius:999px; color:white;
+        font-weight:600; font-size:0.9rem;
+      }}
+      .pill-ok {{ background:#10b981; }}    /* emerald-500 */
+      .pill-bad {{ background:#ef4444; }}   /* red-500 */
 
-# ============================ Utilitaires ===========================
+      .badge {{
+        display:inline-block; padding:2px 8px; border-radius:8px;
+        background:#eef2ff; color:#3730a3; font-weight:600; font-size:0.8rem;
+      }}
 
-@st.cache_resource(show_spinner="Chargement du modèle...")
-def load_model(pkl_path: str) -> Tuple[Any, str]:
-    """Charge le modèle pickle (gère les chemins relatifs)."""
+      .primary {{ color: {PRIMARY_COLOR}; }}
+      .btn-primary > button {{ background:{PRIMARY_COLOR} !important; color:#fff !important; border-radius:12px !important; }}
+      .btn-ghost   > button {{ border:1px solid #e5e7eb !important; border-radius:12px !important; background:white !important; color:#111827 !important; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ============================ Utilitaires ============================
+
+@st.cache_resource(show_spinner=False)
+def load_model(pkl_path: str):
     p = Path(pkl_path)
     if not p.exists():
         base = Path(__file__).resolve().parent
-        cands = [(base / pkl_path).resolve(), (base / ".." / pkl_path).resolve()]
-        p = next((c for c in cands if c.exists()), p)
+        for cand in [(base / pkl_path).resolve(), (base / ".." / pkl_path).resolve()]:
+            if cand.exists():
+                p = cand; break
     if not p.exists():
-        raise FileNotFoundError(f"Modèle introuvable aux emplacements vérifiés : {pkl_path}")
+        raise FileNotFoundError(f"Modèle introuvable: {pkl_path}")
     return joblib.load(p), str(p)
 
-@st.cache_data
 def try_load_df(path: Optional[str]) -> Optional[pd.DataFrame]:
-    """Charge un CSV si possible ; sinon renvoie None."""
-    if not path: return None
+    if not path:
+        return None
     p = Path(path)
     if not p.is_absolute():
         base = Path(__file__).resolve().parent
-        cands = [(base / path).resolve(), (base / ".." / path).resolve()]
-        p = next((c for c in cands if c.exists()), p)
+        for cand in [(base / path).resolve(), (base / ".." / path).resolve()]:
+            if cand.exists():
+                p = cand; break
+    if not p.exists():
+        return None
     try:
         return pd.read_csv(p)
     except Exception:
         return None
 
+def parse_float_maybe(raw: str) -> Optional[float]:
+    if raw is None:
+        return None
+    s = str(raw).strip().replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
 def predict_proba_safe(model, X: pd.DataFrame) -> np.ndarray:
-    """Renvoie une proba de classe 1, quelle que soit l'API du modèle."""
-    if hasattr(model, "predict_proba"):
+    try:
         return model.predict_proba(X)[:, 1]
-    if hasattr(model, "decision_function"):
+    except Exception:
+        pass
+    try:
         from scipy.special import expit
         return expit(model.decision_function(X))
-    y = model.predict(X)
-    return np.asarray(y, dtype=float).flatten()
+    except Exception:
+        y = np.asarray(model.predict(X), dtype=float)
+        return y[:, 1] if y.ndim == 2 and y.shape[1] > 1 else y
 
-def numeric_text_input(label: str, default: float, key: str, **kwargs) -> float:
-    """Champ texte 'numérique' qui accepte virgule/point et valide les bornes."""
-    min_val, max_val = kwargs.get("min_value"), kwargs.get("max_value")
-    is_int = kwargs.get("integer", False)
+def draw_gauge(prob: float):
+    """Jauge circulaire (donut) simple avec matplotlib."""
+    prob = max(0.0, min(1.0, prob))
+    sizes = [prob, 1 - prob]
+    fig, ax = plt.subplots(figsize=(3.5, 3.5))
+    wedges, _ = ax.pie(
+        sizes, startangle=90, counterclock=False,
+        wedgeprops=dict(width=0.28, edgecolor="white")
+    )
+    # Couleurs (prob en primary, reste en gris)
+    wedges[0].set_facecolor(PRIMARY_COLOR)
+    wedges[1].set_facecolor("#e5e7eb")
+    ax.text(0, 0, f"{prob:.3f}\n", ha="center", va="center", fontsize=16, fontweight="bold")
+    ax.set(aspect="equal")
+    st.pyplot(fig, use_container_width=False)
+    plt.close(fig)
 
-    raw = st.text_input(label, value=f"{default}", key=key)
-    s = raw.strip().replace(",", ".")
-    try:
-        val = float(s)
-    except ValueError:
-        st.error(f"'{label}' doit être un nombre valide (ex: 1234.56).", icon="🚨")
-        st.stop()
+def defaults_from_df(df: pd.DataFrame, cols: List[str]) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    for c in cols:
+        if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
+            d[c] = float(np.nanmedian(df[c].dropna())) if df[c].notna().any() else 0.0
+        else:
+            d[c] = ""
+    return d
 
-    if min_val is not None and val < min_val:
-        st.error(f"'{label}' doit être supérieur ou égal à {min_val}.", icon="🔼")
-        st.stop()
-    if max_val is not None and val > max_val:
-        st.error(f"'{label}' doit être inférieur ou égal à {max_val}.", icon="🔽")
-        st.stop()
-
-    return float(int(round(val))) if is_int else val
-
-def create_score_gauge(score: float, threshold: float) -> go.Figure:
-    """Crée une jauge de score avec Plotly."""
-    if score >= threshold:
-        color = "#dc3545" # Rouge
-        text = "Risque Élevé"
-    else:
-        color = "#28a745" # Vert
-        text = "Risque Faible"
-
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=score * 100,
-        number={'suffix': "%", 'font': {'size': 40}},
-        domain={'x': [0, 1], 'y': [0, 1]},
-        title={'text': text, 'font': {'size': 24, 'color': color}},
-        delta={'reference': threshold * 100, 'increasing': {'color': "#dc3545"}, 'decreasing': {'color': "#28a745"}},
-        gauge={
-            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
-            'bar': {'color': color, 'thickness': 0.3},
-            'bgcolor': "white",
-            'borderwidth': 2,
-            'bordercolor': "gray",
-            'steps': [
-                {'range': [0, threshold * 100], 'color': 'rgba(40, 167, 69, 0.2)'},
-                {'range': [threshold * 100, 100], 'color': 'rgba(220, 53, 69, 0.2)'},
-            ],
-            'threshold': {
-                'line': {'color': "black", 'width': 4},
-                'thickness': 0.75,
-                'value': threshold * 100
-            }
-        }))
-    fig.update_layout(height=300, margin=dict(l=20, r=20, t=50, b=20))
-    return fig
-
-
-# ============================ Chargements & Initialisation ===========================
+# ============================ Chargements ============================
 
 try:
     model, resolved_model_path = load_model(MODEL_PKL)
 except Exception as e:
-    st.error(f"**Erreur Critique :** Impossible de charger le modèle. Vérifiez le chemin `{MODEL_PKL}`.\n\n*Détail : {e}*", icon="❌")
+    st.error(f"❌ Impossible de charger le modèle: {e}")
     st.stop()
 
-df_data = try_load_df(DATA_PATH)
+df = try_load_df(DATA_PATH)
 
-if hasattr(model, "feature_names_in_"):
-    feature_cols: List[str] = list(model.feature_names_in_)
-elif df_data is not None:
-    feature_cols = [c for c in df_data.columns if c != TARGET_COL]
+# Features dans l'ordre du modèle si dispo
+if hasattr(model, "feature_names_in_") and len(getattr(model, "feature_names_in_")) > 0:
+    feature_cols: List[str] = list(getattr(model, "feature_names_in_"))
 else:
-    st.error("**Erreur Critique :** Impossible de déterminer les variables d'entrée.", icon="❌")
-    st.stop()
+    if df is None:
+        st.error("❌ Ni dataset ni feature_names_in_ : impossible de déduire les variables d'entrée.")
+        st.stop()
+    if TARGET_COL not in df.columns:
+        st.error(f"❌ Colonne cible « {TARGET_COL} » absente du CSV.")
+        st.stop()
+    feature_cols = [c for c in df.columns if c != TARGET_COL]
 
+# ============================ En-tête ============================
 
-# ================================ Interface Utilisateur =================================
+c1, c2 = st.columns([0.72, 0.28])
+with c1:
+    st.markdown(f"<h2 class='primary'>🏦 Loan Default — Scoring</h2>", unsafe_allow_html=True)
+    st.caption("Saisis librement tes valeurs (virgule ou point). Seules quelques variables ont des bornes logiques (FICO, comptes ≥ 0).")
+with c2:
+    st.markdown("<div class='app-card'><span class='badge'>Modèle</span><br/>"
+                f"<code>{Path(resolved_model_path).name}</code><br/>"
+                f"{'Dataset : <code>'+Path(DATA_PATH).name+'</code>' if df is not None else 'Dataset : <i>non fourni</i>'}"
+                "</div>", unsafe_allow_html=True)
 
-st.title("🏦 Évaluateur de Risque de Crédit")
-st.markdown("Entrez les informations du demandeur pour obtenir un score de probabilité de défaut de paiement.")
+st.divider()
 
-# --- BARRE LATÉRALE ---
-with st.sidebar:
-    st.header("⚙️ Options")
-    threshold = st.slider("Seuil de décision", 0.0, 1.0, float(DEF_THRESH), 0.01,
-                            help="Probabilité au-dessus de laquelle le statut est 'Défaut'.")
+# ============================ Presets & seuil ============================
 
-    st.markdown("---")
-    st.header("Informations du Modèle")
-    st.info(f"**Modèle chargé** :\n`{Path(resolved_model_path).name}`")
-    if df_data is not None:
-        st.success(f"**Données de référence** :\n`{Path(DATA_PATH).name}`")
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+
+# valeurs par défaut (CSV -> médianes, sinon 0)
+default_inputs = defaults_from_df(df, feature_cols) if df is not None else {c: 0.0 for c in feature_cols}
+
+# Barre d’actions
+ac1, ac2, ac3, ac4 = st.columns([0.25, 0.25, 0.25, 0.25])
+with ac1:
+    if st.button("🎯 Exemple réaliste", use_container_width=True):
+        st.session_state["preset"] = "realistic"
+with ac2:
+    if st.button("🚩 Client risqué", use_container_width=True):
+        st.session_state["preset"] = "risky"
+with ac3:
+    if st.button("↺ Réinitialiser", use_container_width=True, type="secondary"):
+        st.session_state["preset"] = "reset"
+with ac4:
+    threshold = st.slider("Seuil de décision", 0.0, 1.0, float(DEF_THRESH), 0.01)
+
+# Gérer presets
+preset = st.session_state.get("preset")
+if preset == "realistic":
+    # médianes du CSV si dispo, sinon valeurs crédibles
+    if df is not None:
+        default_inputs = defaults_from_df(df, feature_cols)
     else:
-        st.warning("**Aucun fichier de données** de référence n'a été trouvé. Les valeurs par défaut sont à 0.")
+        default_inputs.update(dict(credit_lines_outstanding=1, income=50000, years_employed=3,
+                                   loan_amt_outstanding=3000, total_debt_outstanding=7000, fico_score=660))
+elif preset == "risky":
+    default_inputs.update(dict(credit_lines_outstanding=5, income=20000, years_employed=1,
+                               loan_amt_outstanding=9000, total_debt_outstanding=35000, fico_score=520))
+elif preset == "reset":
+    default_inputs = defaults_from_df(df, feature_cols) if df is not None else {c: 0.0 for c in feature_cols}
+st.session_state["preset"] = None  # consomme le preset
 
-# --- FORMULAIRE DE SAISIE PRINCIPAL ---
-inputs: Dict[str, Any] = {}
-with st.form("loan_application_form"):
-    st.header("📝 Formulaire de demande")
+# ============================ Formulaire (groupé) ============================
 
-    # Organisation en colonnes pour une meilleure lisibilité
-    col1, col2, col3 = st.columns(3)
+with st.form("predict-form"):
+    st.markdown("### Paramètres saisis")
 
-    # Répartir les champs dans les colonnes
-    # (Cette répartition manuelle est plus robuste qu'une boucle pour le design)
-    fields_per_col = (len(feature_cols) + 2) // 3
-    feature_chunks = [
-        feature_cols[i:i + fields_per_col]
-        for i in range(0, len(feature_cols), fields_per_col)
-    ]
+    inputs: Dict[str, Any] = {}
+    errors: List[str] = []
 
-    cols_widgets = [col1, col2, col3]
+    # rend un champ numérique (texte) avec aide
+    def field(col: str, label: str, default_val: Any, help_txt: str = "", integer: bool = False):
+        val_raw = st.text_input(label, value=str(default_val), help=help_txt, key=f"fld_{col}")
+        val = parse_float_maybe(val_raw)
+        if val is None:
+            errors.append(f"« {label} » doit être un nombre (ex: 0,25).")
+            return None
+        if integer:
+            val = float(int(round(val)))
+        # validation "hard bounds"
+        if col not in NO_BOUNDS and col in HARD_BOUNDS:
+            lo, hi = HARD_BOUNDS[col]
+            if lo is not None and val < lo: errors.append(f"« {label} » doit être ≥ {lo}.")
+            if hi is not None and val > hi: errors.append(f"« {label} » doit être ≤ {hi}.")
+        return val
 
-    for i, chunk in enumerate(feature_chunks):
-        with cols_widgets[i]:
-            for col in chunk:
-                # Logique pour déterminer le type de champ et les valeurs par défaut
-                if df_data is not None and col in df_data.columns:
-                    s = df_data[col].dropna()
-                    if pd.api.types.is_numeric_dtype(s):
-                        default = float(s.median()) if not s.empty else 0.0
-                        is_int = pd.api.types.is_integer_dtype(df_data[col]) or (col in LIKELY_INT_COLS)
-                        minv, maxv = (None, None) if col in NO_BOUNDS else HARD_BOUNDS.get(col, (None, None))
-                        inputs[col] = numeric_text_input(col, default, key=col, integer=is_int, min_value=minv, max_value=maxv)
-                    elif s.nunique() <= 2: # Booléen / Binaire
-                        default_bool = bool(s.mode()[0]) if not s.empty else False
-                        inputs[col] = st.radio(col, [False, True], index=int(default_bool), horizontal=True, key=col)
-                    elif s.nunique() <= 25: # Catégoriel
-                        choices = sorted(map(str, s.unique().tolist()))
-                        default_choice = str(s.mode()[0]) if not s.empty else choices[0]
-                        inputs[col] = st.selectbox(col, choices, index=choices.index(default_choice), key=col)
-                    else: # Texte
-                        default_txt = str(s.mode()[0]) if not s.empty else ""
-                        inputs[col] = st.text_input(col, value=default_txt, key=col)
-                else: # Fallback si pas de CSV
-                    is_int = col in LIKELY_INT_COLS
-                    minv, maxv = (None, None) if col in NO_BOUNDS else HARD_BOUNDS.get(col, (None, None))
-                    inputs[col] = numeric_text_input(col, 0.0, key=col, integer=is_int, min_value=minv, max_value=maxv)
+    # Parcours par groupes, seulement pour les features présentes
+    for group_name, cols in GROUPS.items():
+        cols_present = [c for c in cols if c in feature_cols]
+        if not cols_present:
+            continue
+        st.markdown(f"#### {group_name}")
+        gc1, gc2, gc3 = st.columns(3)
+        col_streams = [gc1, gc2, gc3]
+        i = 0
+        for col in cols_present:
+            # config du champ
+            integer = (df is not None and col in df.columns and pd.api.types.is_integer_dtype(df[col])) or (col in LIKELY_INT_COLS)
+            help_txt = ""
+            if col in HARD_BOUNDS and col not in NO_BOUNDS:
+                lo, hi = HARD_BOUNDS[col]
+                mini = f"≥ {lo}" if lo is not None else ""
+                maxi = f"≤ {hi}" if hi is not None else ""
+                help_txt = f"Contrainte: {mini}{' / ' if mini and maxi else ''}{maxi}"
+            label = col.replace("_", " ")
+            with col_streams[i % 3]:
+                inputs[col] = field(col, label, default_inputs.get(col, 0.0), help_txt, integer=integer)
+                i += 1
 
-    st.markdown("---")
-    submitted = st.form_submit_button("🔮 Analyser le Dossier", use_container_width=True)
+    # Afficher les features non mappées dans GROUPS (si le modèle en a d'autres)
+    others = [c for c in feature_cols if c not in sum(GROUPS.values(), [])]
+    if others:
+        st.markdown("#### Autres")
+        oc1, oc2, oc3 = st.columns(3)
+        ocols = [oc1, oc2, oc3]
+        i = 0
+        for col in others:
+            integer = col in LIKELY_INT_COLS
+            with ocols[i % 3]:
+                inputs[col] = field(col, col.replace("_"," "), default_inputs.get(col, 0.0), integer=integer)
+                i += 1
 
+    # Aperçu tabulaire
+    st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+    st.dataframe(pd.DataFrame([inputs], columns=feature_cols), use_container_width=True, hide_index=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# --- SECTION DES RÉSULTATS ---
+    # Bouton prédire
+    submitted = st.form_submit_button("🔮 Prédire", use_container_width=True)
+
+# ============================ Prédiction ============================
+
 if submitted:
-    st.header("✅ Résultats de l'Analyse")
-    X = pd.DataFrame([inputs], columns=feature_cols)
+    if errors:
+        st.error("Merci de corriger les champs suivants :")
+        for e in errors:
+            st.write(f"• {e}")
+    else:
+        X = pd.DataFrame([inputs], columns=feature_cols)
+        # Forcer conversion numérique si le CSV dit que c'est numérique
+        if df is not None:
+            for c in feature_cols:
+                if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
+                    try:
+                        X[c] = pd.to_numeric(pd.Series(X[c]), errors="coerce")
+                    except Exception:
+                        pass
 
-    # Conversion de type finale
-    if df_data is not None:
-        for c in feature_cols:
-            if c in df_data.columns and pd.api.types.is_numeric_dtype(df_data[c]):
-                X[c] = pd.to_numeric(X[c], errors='coerce')
+        try:
+            proba = float(predict_proba_safe(model, X)[0])
+            pred = int(proba >= threshold)
 
-    try:
-        proba = float(predict_proba_safe(model, X)[0])
-        pred = int(proba >= threshold)
+            st.success("Prédiction effectuée ✅")
 
-        res_col1, res_col2 = st.columns([1, 1.5])
+            cc1, cc2, cc3 = st.columns([0.3, 0.4, 0.3])
+            with cc1:
+                st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+                st.metric("Probabilité (classe 1)", f"{proba:.3f}")
+                st.markdown("</div>", unsafe_allow_html=True)
 
-        with res_col1:
-            if pred == 1:
-                verdict_text = "Risque Élevé"
-                reco_text = "Défaut de paiement probable"
-                css_class = "high-risk"
-            else:
-                verdict_text = "Risque Faible"
-                reco_text = "Dossier favorable"
-                css_class = "low-risk"
+            with cc2:
+                st.markdown("<div class='app-card' style='display:flex;justify-content:center;'>", unsafe_allow_html=True)
+                draw_gauge(proba)
+                st.markdown("</div>", unsafe_allow_html=True)
 
-            st.markdown(f"""
-            <div class="result-card {css_class}">
-                <h3>{verdict_text}</h3>
-                <p>{reco_text}</p>
-            </div>
-            """, unsafe_allow_html=True)
-            st.metric("Score de Probabilité (Défaut)", f"{proba:.2%}")
-            st.caption(f"Calculé avec un seuil de décision à {threshold:.0%}")
+            with cc3:
+                st.markdown("<div class='app-card'>", unsafe_allow_html=True)
+                pill = "<span class='pill pill-bad'>1 (défaut)</span>" if pred == 1 else "<span class='pill pill-ok'>0 (non défaut)</span>"
+                st.markdown(f"**Décision**<br/>{pill}<br/><br/><span class='badge'>Seuil</span> {threshold:.2f}", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
 
+            # Historique et export
+            result = {
+                "inputs": inputs,
+                "probability": proba,
+                "decision": pred,
+                "threshold": threshold,
+            }
+            st.session_state["history"].insert(0, result)
+            st.session_state["history"] = st.session_state["history"][:10]
 
-        with res_col2:
-            st.plotly_chart(create_score_gauge(proba, threshold), use_container_width=True)
+            export_json = json.dumps(result, ensure_ascii=False, indent=2)
+            st.download_button("💾 Télécharger résultat (JSON)", data=export_json, file_name="prediction.json")
 
-        with st.expander("📂 Voir les données saisies"):
-            st.dataframe(X)
+        except Exception as e:
+            st.error(f"Erreur de prédiction : {e}")
 
-    except Exception as e:
-        st.error(f"**Erreur lors de la prédiction :**\n\n`{e}`", icon="🔥")
+# ============================ Panneaux d'infos ============================
+
+with st.expander("🧾 Détails & journal"):
+    st.write(f"Chemin modèle : `{resolved_model_path}`")
+    st.write(f"Variables détectées : {len(feature_cols)}")
+    st.write("Sans seuils sur : " + (", ".join(sorted(NO_BOUNDS)) or "—"))
+    if HARD_BOUNDS:
+        st.write("Contraintes indispensables :", HARD_BOUNDS)
+
+    if st.session_state["history"]:
+        st.markdown("**Dernières prédictions**")
+        st.table(pd.DataFrame(st.session_state["history"]))
+
+with st.expander("💡 Astuces d’utilisation"):
+    st.markdown(
+        """
+        - Tu peux **entrer « 0,06 »** ou « 0.06 » : les deux sont compris.
+        - Les champs **FICO** et **lignes de crédit** sont **contrôlés** (domaine logique).
+        - Utilise les **Presets** en haut pour tester vite des scénarios.
+        - Le **seuil** s’ajuste en haut à droite ; il pilote la décision (0/1).
+        - Le bouton **Télécharger** exporte la requête/réponse en JSON.
+        """
+    )
