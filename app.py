@@ -1,16 +1,15 @@
-# app.py — Loan Default Scoring (UI améliorée)
-# - Conserve tes règles: pas de seuil sur {total_debt_outstanding, income, years_employed, loan_amt_outstanding}
+# app.py — Loan Default Scoring (UI sans presets)
+# - Pas de seuil sur {total_debt_outstanding, income, years_employed, loan_amt_outstanding}
 # - Seuils indispensables: fico_score (300..850), credit_lines_outstanding >=0, customer_id >=0
 # - Saisie texte (virgule/point), validation douce (messages sans st.stop)
 # - CSV optionnel pour typer et proposer des défauts
-# - Design: cartes, presets, jauge circulaire, historique, téléchargement JSON
+# - Design: cartes, jauge circulaire, historique, téléchargement JSON
 
 from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import json
-import io
 
 import numpy as np
 import pandas as pd
@@ -62,11 +61,9 @@ GROUPS = {
 st.markdown(
     f"""
     <style>
-      /* Masquer le footer & hamburger */
       #MainMenu {{visibility:hidden;}}
       footer {{visibility:hidden;}}
 
-      /* Titres & cartes */
       .app-card {{
         border: 1px solid #e5e7eb; border-radius: 16px; padding: 16px;
         background: #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.04);
@@ -151,7 +148,6 @@ def draw_gauge(prob: float):
         sizes, startangle=90, counterclock=False,
         wedgeprops=dict(width=0.28, edgecolor="white")
     )
-    # Couleurs (prob en primary, reste en gris)
     wedges[0].set_facecolor(PRIMARY_COLOR)
     wedges[1].set_facecolor("#e5e7eb")
     ax.text(0, 0, f"{prob:.3f}\n", ha="center", va="center", fontsize=16, fontweight="bold")
@@ -204,7 +200,7 @@ with c2:
 
 st.divider()
 
-# ============================ Presets & seuil ============================
+# ============================ Seuil uniquement (pas de presets) ============================
 
 if "history" not in st.session_state:
     st.session_state["history"] = []
@@ -212,35 +208,10 @@ if "history" not in st.session_state:
 # valeurs par défaut (CSV -> médianes, sinon 0)
 default_inputs = defaults_from_df(df, feature_cols) if df is not None else {c: 0.0 for c in feature_cols}
 
-# Barre d’actions
-ac1, ac2, ac3, ac4 = st.columns([0.25, 0.25, 0.25, 0.25])
-with ac1:
-    if st.button("🎯 Exemple réaliste", use_container_width=True):
-        st.session_state["preset"] = "realistic"
-with ac2:
-    if st.button("🚩 Client risqué", use_container_width=True):
-        st.session_state["preset"] = "risky"
-with ac3:
-    if st.button("↺ Réinitialiser", use_container_width=True, type="secondary"):
-        st.session_state["preset"] = "reset"
-with ac4:
+# Slider seuil aligné à droite
+tool_l, tool_r = st.columns([0.7, 0.3])
+with tool_r:
     threshold = st.slider("Seuil de décision", 0.0, 1.0, float(DEF_THRESH), 0.01)
-
-# Gérer presets
-preset = st.session_state.get("preset")
-if preset == "realistic":
-    # médianes du CSV si dispo, sinon valeurs crédibles
-    if df is not None:
-        default_inputs = defaults_from_df(df, feature_cols)
-    else:
-        default_inputs.update(dict(credit_lines_outstanding=1, income=50000, years_employed=3,
-                                   loan_amt_outstanding=3000, total_debt_outstanding=7000, fico_score=660))
-elif preset == "risky":
-    default_inputs.update(dict(credit_lines_outstanding=5, income=20000, years_employed=1,
-                               loan_amt_outstanding=9000, total_debt_outstanding=35000, fico_score=520))
-elif preset == "reset":
-    default_inputs = defaults_from_df(df, feature_cols) if df is not None else {c: 0.0 for c in feature_cols}
-st.session_state["preset"] = None  # consomme le preset
 
 # ============================ Formulaire (groupé) ============================
 
@@ -250,7 +221,6 @@ with st.form("predict-form"):
     inputs: Dict[str, Any] = {}
     errors: List[str] = []
 
-    # rend un champ numérique (texte) avec aide
     def field(col: str, label: str, default_val: Any, help_txt: str = "", integer: bool = False):
         val_raw = st.text_input(label, value=str(default_val), help=help_txt, key=f"fld_{col}")
         val = parse_float_maybe(val_raw)
@@ -259,7 +229,6 @@ with st.form("predict-form"):
             return None
         if integer:
             val = float(int(round(val)))
-        # validation "hard bounds"
         if col not in NO_BOUNDS and col in HARD_BOUNDS:
             lo, hi = HARD_BOUNDS[col]
             if lo is not None and val < lo: errors.append(f"« {label} » doit être ≥ {lo}.")
@@ -276,7 +245,6 @@ with st.form("predict-form"):
         col_streams = [gc1, gc2, gc3]
         i = 0
         for col in cols_present:
-            # config du champ
             integer = (df is not None and col in df.columns and pd.api.types.is_integer_dtype(df[col])) or (col in LIKELY_INT_COLS)
             help_txt = ""
             if col in HARD_BOUNDS and col not in NO_BOUNDS:
@@ -307,7 +275,6 @@ with st.form("predict-form"):
     st.dataframe(pd.DataFrame([inputs], columns=feature_cols), use_container_width=True, hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Bouton prédire
     submitted = st.form_submit_button("🔮 Prédire", use_container_width=True)
 
 # ============================ Prédiction ============================
@@ -319,7 +286,6 @@ if submitted:
             st.write(f"• {e}")
     else:
         X = pd.DataFrame([inputs], columns=feature_cols)
-        # Forcer conversion numérique si le CSV dit que c'est numérique
         if df is not None:
             for c in feature_cols:
                 if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
@@ -351,7 +317,6 @@ if submitted:
                 st.markdown(f"**Décision**<br/>{pill}<br/><br/><span class='badge'>Seuil</span> {threshold:.2f}", unsafe_allow_html=True)
                 st.markdown("</div>", unsafe_allow_html=True)
 
-            # Historique et export
             result = {
                 "inputs": inputs,
                 "probability": proba,
@@ -385,7 +350,6 @@ with st.expander("💡 Astuces d’utilisation"):
         """
         - Tu peux **entrer « 0,06 »** ou « 0.06 » : les deux sont compris.
         - Les champs **FICO** et **lignes de crédit** sont **contrôlés** (domaine logique).
-        - Utilise les **Presets** en haut pour tester vite des scénarios.
         - Le **seuil** s’ajuste en haut à droite ; il pilote la décision (0/1).
         - Le bouton **Télécharger** exporte la requête/réponse en JSON.
         """
