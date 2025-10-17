@@ -1,4 +1,5 @@
 # le fichier test pour tester avant 
+# ce fichier permet à l'application de faire un test 
 
 import os
 import joblib
