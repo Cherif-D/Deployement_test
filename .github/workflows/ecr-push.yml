@@ -1,15 +1,20 @@
-name: Push to ECR
+name: CI/CD — Push to ECR & Redeploy ECS
+
 on:
   push:
     branches: ["main"]
 
+concurrency:
+  group: ecs-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}     # eu-west-3
   ECR_REPOSITORY: loan-default
   IMAGE_TAG: latest
 
 jobs:
-  push-ecr:
+  build-push-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -17,16 +22,33 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
       - id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+
       - name: Build, tag and push to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
+          docker build --platform linux/amd64 \
+            -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
           docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      - name: Force new deployment on ECS
+        env:
+          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
