@@ -1,9 +1,4 @@
 # app.py — Loan Default Scoring (UI sans presets)
-# - Pas de seuil sur {total_debt_outstanding, income, years_employed, loan_amt_outstanding}
-# - Seuils indispensables: fico_score (300..850), credit_lines_outstanding >=0, customer_id >=0
-# - Saisie texte (virgule/point), validation douce (messages sans st.stop)
-# - CSV optionnel pour typer et proposer des défauts
-# - Design: cartes, jauge circulaire, historique, téléchargement JSON
 
 from __future__ import annotations
 import os
